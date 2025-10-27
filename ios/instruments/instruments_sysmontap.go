@@ -1,6 +1,8 @@
 package instruments
 
 import (
+	"context"
+	"errors"
 	"fmt"
 
 	"github.com/danielpaulus/go-ios/ios"
@@ -10,14 +12,22 @@ import (
 
 type sysmontapMsgDispatcher struct {
 	messages chan dtx.Message
+	ctx      context.Context
 }
 
-func newSysmontapMsgDispatcher() *sysmontapMsgDispatcher {
-	return &sysmontapMsgDispatcher{make(chan dtx.Message)}
+func newSysmontapMsgDispatcher(ctx context.Context) *sysmontapMsgDispatcher {
+	return &sysmontapMsgDispatcher{
+		messages: make(chan dtx.Message),
+		ctx:      ctx,
+	}
 }
 
 func (p *sysmontapMsgDispatcher) Dispatch(m dtx.Message) {
-	p.messages <- m
+	select {
+	case p.messages <- m:
+	// Close() called, p.messages no longer being processed, discard subsequent messages
+	case <-p.ctx.Done():
+	}
 }
 
 const sysmontapName = "com.apple.instruments.server.services.sysmontap"
@@ -28,6 +38,9 @@ type sysmontapService struct {
 
 	deviceInfoService *DeviceInfoService
 	msgDispatcher     *sysmontapMsgDispatcher
+
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewSysmontapService creates a new sysmontapService
@@ -41,7 +54,9 @@ func NewSysmontapService(device ios.DeviceEntry, samplingInterval int) (*sysmont
 		return nil, err
 	}
 
-	msgDispatcher := newSysmontapMsgDispatcher()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	msgDispatcher := newSysmontapMsgDispatcher(ctx)
 	dtxConn, err := connectInstrumentsWithMsgDispatcher(device, msgDispatcher)
 	if err != nil {
 		return nil, err
@@ -68,6 +83,7 @@ func NewSysmontapService(device ios.DeviceEntry, samplingInterval int) (*sysmont
 		"physFootprint":  true,
 		"sampleInterval": 500000000,
 	}
+
 	_, err = processControlChannel.MethodCall("setConfig:", config)
 	if err != nil {
 		return nil, err
@@ -78,13 +94,14 @@ func NewSysmontapService(device ios.DeviceEntry, samplingInterval int) (*sysmont
 		return nil, err
 	}
 
-	return &sysmontapService{processControlChannel, dtxConn, deviceInfoService, msgDispatcher}, nil
+	return &sysmontapService{
+		processControlChannel, dtxConn, deviceInfoService, msgDispatcher, ctx, cancel,
+	}, nil
 }
 
-// Close closes up the DTX connection, message dispatcher and dtx.Message channel
+// Close closes up the DTX connection and message dispatcher
 func (s *sysmontapService) Close() error {
-	close(s.msgDispatcher.messages)
-
+	s.cancel()
 	s.deviceInfoService.Close()
 	return s.conn.Close()
 }
@@ -113,13 +130,63 @@ func (s *sysmontapService) ReceiveCPUUsage() chan SysmontapMessage {
 	return messages
 }
 
+// GetSystemMetrics returns a single SysmontapMessage with CPU and Memory info. Currently
+// only the first message in s.msgDispatcher.messages contains memory information, so you can't
+// meaningfully use a continuous tap if you want memory data.
+func GetSystemMetrics(device ios.DeviceEntry, cpuSampleDelay int) (SysmontapMessage, error) {
+	sysmon, err := NewSysmontapService(device, 10)
+	if err != nil {
+		return SysmontapMessage{}, err
+	}
+	defer sysmon.Close()
+
+	firstMessage := SysmontapMessage{}
+	messagesReceived := 0
+
+	for msg := range sysmon.msgDispatcher.messages {
+		cpuDataOnly := messagesReceived > 0
+		sysmontapMessage, err := mapToCPUAndSystemMetrics(msg, cpuDataOnly)
+		if err != nil {
+			continue
+		}
+		// As a rule, first CPU_TotalLoad message is garbage data, often 0. Second message often inflated by
+		// our efforts setting up the query.
+		if messagesReceived == 0 {
+			firstMessage = sysmontapMessage
+		}
+		if messagesReceived < cpuSampleDelay {
+			messagesReceived += 1
+			continue
+		}
+		firstMessage.SystemCPUUsage.CPU_TotalLoad = sysmontapMessage.SystemCPUUsage.CPU_TotalLoad
+		return firstMessage, nil
+	}
+	return SysmontapMessage{}, errors.New("sysmontapMessage channel closed with no messages received")
+}
+
+// MemoryUsage holds computed memory metrics in bytes.
+// A value of 0 can indicate "unavailable" or "zero".
+type MemoryUsage struct {
+	Total       uint64 // Installed memory
+	Free        uint64 // Unallocated
+	Cache       uint64 // Cached Files + Discardable
+	Available   uint64 // Free + Cache
+	Compressed  uint64
+	Used        uint64 // Total - Free - Cached
+	Wired       uint64
+	Swap        uint64
+	Application uint64
+}
+
 // SysmontapMessage is a wrapper struct for incoming CPU samples
 type SysmontapMessage struct {
-	CPUCount       uint64
-	EnabledCPUs    uint64
-	EndMachAbsTime uint64
-	Type           uint64
-	SystemCPUUsage CPUUsage
+	CPUCount         uint64
+	EnabledCPUs      uint64
+	EndMachAbsTime   uint64
+	Type             uint64
+	SystemCPUUsage   CPUUsage
+	RawSystemMetrics map[string]uint64 `json:",omitempty"`
+	MemoryUsage      MemoryUsage
 }
 
 type CPUUsage struct {
@@ -127,6 +194,10 @@ type CPUUsage struct {
 }
 
 func mapToCPUUsage(msg dtx.Message) (SysmontapMessage, error) {
+	return mapToCPUAndSystemMetrics(msg, true)
+}
+
+func mapToCPUAndSystemMetrics(msg dtx.Message, cpuDataOnly bool) (SysmontapMessage, error) {
 	payload := msg.Payload
 	if len(payload) != 1 {
 		return SysmontapMessage{}, fmt.Errorf("payload of message should have only one element: %+v", msg)
@@ -167,11 +238,105 @@ func mapToCPUUsage(msg dtx.Message) (SysmontapMessage, error) {
 	cpuUsage := CPUUsage{CPU_TotalLoad: cpuTotalLoad}
 
 	sysmontapMessage := SysmontapMessage{
-		cpuCount,
-		enabledCPUs,
-		endMachAbsTime,
-		typ,
-		cpuUsage,
+		CPUCount:       cpuCount,
+		EnabledCPUs:    enabledCPUs,
+		EndMachAbsTime: endMachAbsTime,
+		Type:           typ,
+		SystemCPUUsage: cpuUsage,
 	}
+
+	if cpuDataOnly {
+		return sysmontapMessage, nil
+	}
+
+	systemAttributesRaw, okA := resultMap["SystemAttributes"].([]interface{})
+	systemValuesRaw, okS := resultMap["System"].([]interface{})
+
+	if !okA || !okS || len(systemAttributesRaw) != len(systemValuesRaw) {
+		return sysmontapMessage, nil
+	}
+
+	rawMetrics := make(map[string]uint64)
+	for i, keyRaw := range systemAttributesRaw {
+		key, ok := keyRaw.(string)
+		if !ok {
+			// If the array exists, it should be well-formed.
+			return SysmontapMessage{}, fmt.Errorf("SystemAttributes key at index %d is not a string: %v", i, keyRaw)
+		}
+
+		// Values can come in as various number types (int, int64, float64, etc.)
+		// We'll normalize them to int64.
+		var uintVal uint64
+		valRaw := systemValuesRaw[i]
+		switch v := valRaw.(type) {
+		case int64:
+			uintVal = uint64(v)
+		case uint64:
+			uintVal = uint64(v)
+		default:
+			// Skip unlikely stats that aren't positive integers instead of crashing
+			continue
+		}
+		rawMetrics[key] = uintVal
+	}
+	sysmontapMessage.RawSystemMetrics = rawMetrics
+
+	// Compute MemoryUsage struct from RawSystemMetrics
+	requiredKeys := []string{
+		"vmIntPageCount",
+		"vmPurgeableCount",
+		"vmExtPageCount",
+		"vmCompressorPageCount",
+		"vmUsedCount",
+		"vmWireCount",
+		"vmFreeCount",
+		"physMemSize",
+		"__vmSwapUsage",
+	}
+
+	// Check that all keys exist
+	for _, key := range requiredKeys {
+		if _, ok := rawMetrics[key]; !ok {
+			log.Errorf("SystemAttributes missing required key '%s' ", key)
+			// Memory computations will be returned as zeros, but whatever raw data is available
+			// and all CPU data will be returned while logging the error
+			return sysmontapMessage, nil
+		}
+	}
+	// True for 64bit arm, iPhone6+
+	// This page size is needed to make any sense of the raw metrics, we may as well make it available.
+	// If it ever changes, we will need to add code somehow to detect it, or the calculations will
+	// all be incorrect.
+	vmPageSize := uint64(16384)
+	rawMetrics["__vmPageSize"] = vmPageSize
+
+	// For details, look up "struct vm_statistics" and/or vm_statistics64_data_t
+	appMemPages := rawMetrics["vmIntPageCount"] // - rawMetrics["vmPurgeableCount"]
+
+	// With this calculation, free + cached + user = Total.  May not match iOS task manager exactly
+	freePages := rawMetrics["vmFreeCount"]
+	cachedPages := rawMetrics["vmExtPageCount"] + rawMetrics["vmPurgeableCount"]
+	memUsedPages := rawMetrics["vmUsedCount"] - rawMetrics["vmExtPageCount"] - rawMetrics["vmPurgeableCount"]
+
+	compressedPages := rawMetrics["vmCompressorPageCount"]
+	wiredPages := rawMetrics["vmWireCount"]
+	totalMemPages := rawMetrics["physMemSize"]
+	swapBytes := rawMetrics["__vmSwapUsage"] // This one is already in bytes
+
+	memUsage := MemoryUsage{
+		Total:       totalMemPages * vmPageSize,
+		Free:        freePages * vmPageSize,
+		Cache:       cachedPages * vmPageSize,
+		Compressed:  compressedPages * vmPageSize,
+		Used:        memUsedPages * vmPageSize,
+		Wired:       wiredPages * vmPageSize,
+		Application: appMemPages * vmPageSize,
+		Swap:        swapBytes,
+	}
+
+	memUsage.Available = memUsage.Free + memUsage.Cache
+
+	sysmontapMessage.MemoryUsage = memUsage
+
 	return sysmontapMessage, nil
 }

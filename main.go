@@ -129,8 +129,9 @@ Usage:
   ios screenshot [options] [--output=<outfile>] [--stream] [--port=<port>]
   ios setlocation [options] [--lat=<lat>] [--lon=<lon>]
   ios setlocationgpx [options] [--gpxfilepath=<gpxfilepath>]
-  ios syslog [--parse] [options]
+  ios syslog  [--parse] [options]
   ios sysmontap [options]
+  ios sysstats  [--details] [--sysmontap-format] [options]
   ios timeformat (24h | 12h | toggle | get) [--force] [options]
   ios tunnel ls [options]
   ios tunnel start [options] [--pair-record-path=<pairrecordpath>] [--userspace]
@@ -254,7 +255,9 @@ The commands work as following:
    ios setlocation [options] [--lat=<lat>] [--lon=<lon>]              Updates the location of the device to the provided by latitude and longitude coordinates. Example: setlocation --lat=40.730610 --lon=-73.935242
    ios setlocationgpx [options] [--gpxfilepath=<gpxfilepath>]         Updates the location of the device based on the data in a GPX file. Example: setlocationgpx --gpxfilepath=/home/username/location.gpx
    ios syslog [--parse] [options]                                     Prints a device's log output, Use --parse to parse the fields from the log
-   ios sysmontap                                                      Get system stats like MEM, CPU
+   ios sysstats [--details] [--sysmontap-format]                      Get current CPU, memory, and disk stats.  Use --nojson for a human-readable listing. Specify --details to get all raw system values, including disk and network counters.
+   >                                                                  Most raw vm* values are in blocks. Multiply by vmBlockSize for bytes.  Use --sysmontap-format for consistency with sysmontap command.
+   ios sysmontap                                                      Monitors CPU info
    ios timeformat (24h | 12h | toggle | get) [--force] [options] Sets, or returns the state of the "time format". iOS 11+ only (Use --force to try on older versions).
    ios tunnel ls                                                      List currently started tunnels. Use --enabletun to activate using TUN devices rather than user space network. Requires sudo/admin shells. 
    ios tunnel start [options] [--pair-record-path=<pairrecordpath>] [--enabletun]   Creates a tunnel connection to the device. If the device was not paired with the host yet, device pairing will also be executed.
@@ -861,6 +864,13 @@ The commands work as following:
 		printSysmontapStats(device)
 	}
 
+	b, _ = arguments.Bool("sysstats")
+	if b {
+		details, _ := arguments.Bool("--details")
+		useSysmontapFormat, _ := arguments.Bool("--sysmontap-format")
+		printSystemStats(device, 1, disableJSON, details, useSysmontapFormat)
+	}
+
 	b, _ = arguments.Bool("memlimitoff")
 	if b {
 		processName, _ := arguments.String("--process")
@@ -1261,6 +1271,79 @@ func printSysmontapStats(device ios.DeviceEntry) {
 			log.Info("shutting down sysmontap")
 			return
 		}
+	}
+}
+
+func printSystemStats(device ios.DeviceEntry, cpuSampleDelay int, disableJSON bool, details bool, useSysmontapFormat bool) {
+	stats, err := instruments.GetSystemMetrics(device, cpuSampleDelay)
+	if err != nil {
+		exitIfError("Error querying device stats", err)
+	}
+
+	if useSysmontapFormat {
+		fields := log.Fields{
+			"cpu_count":          stats.CPUCount,
+			"enabled_cpus":       stats.EnabledCPUs,
+			"end_time":           stats.EndMachAbsTime,
+			"cpu_total_load":     stats.SystemCPUUsage.CPU_TotalLoad,
+			"memory_total":       stats.MemoryUsage.Total,
+			"memory_free":        stats.MemoryUsage.Free,
+			"memory_used":        stats.MemoryUsage.Used,
+			"memory_available":   stats.MemoryUsage.Available,
+			"memory_compressed":  stats.MemoryUsage.Compressed,
+			"memory_swap":        stats.MemoryUsage.Swap,
+			"memory_wired":       stats.MemoryUsage.Wired,
+			"memory_application": stats.MemoryUsage.Application,
+			"memory_cache":       stats.MemoryUsage.Cache,
+		}
+		if details {
+			fields["raw_metrics"] = stats.RawSystemMetrics
+		}
+		log.WithFields(fields).Info("received system stats")
+		return
+	}
+	if !disableJSON {
+		if !details {
+			stats.RawSystemMetrics = nil
+		}
+		fmt.Println(convertToJSONString(stats))
+		return
+	}
+
+	fmt.Println("=== CPU Info ===")
+	fmt.Printf("CPUCount: %d\n", stats.CPUCount)
+	fmt.Printf("EnabledCPUs: %d\n", stats.EnabledCPUs)
+	fmt.Printf("EndMachAbsTime: %d\n", stats.EndMachAbsTime)
+	// fmt.Printf("Type: %d\n", stats.Type)
+	fmt.Println("--- System CPU Usage ---")
+	fmt.Printf("CPU_TotalLoad: %.2f\n", stats.SystemCPUUsage.CPU_TotalLoad)
+
+	fmt.Println("\n=== Memory Usage ===")
+	fmt.Printf("Total: %d\n", stats.MemoryUsage.Total)
+	fmt.Printf("Used: %d\n", stats.MemoryUsage.Used)
+	fmt.Printf("Cache: %d\n", stats.MemoryUsage.Cache)
+	fmt.Printf("Swap: %d\n", stats.MemoryUsage.Swap)
+	fmt.Printf("Free: %d\n", stats.MemoryUsage.Free)
+	fmt.Printf("Available: %d\n", stats.MemoryUsage.Available)
+	fmt.Printf("Application: %d\n", stats.MemoryUsage.Application)
+	fmt.Printf("Wired: %d\n", stats.MemoryUsage.Wired)
+	fmt.Printf("Compressed: %d\n", stats.MemoryUsage.Compressed)
+
+	if !details {
+		return
+	}
+
+	fmt.Println("\n=== Raw System Metrics ===")
+	// Get sorted keys
+	keys := make([]string, 0, len(stats.RawSystemMetrics))
+	for k := range stats.RawSystemMetrics {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	// Print sorted metrics
+	for _, k := range keys {
+		fmt.Printf("%s: %d\n", k, stats.RawSystemMetrics[k])
 	}
 }
 
