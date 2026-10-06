@@ -1,6 +1,7 @@
 package instruments
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 
@@ -11,14 +12,22 @@ import (
 
 type sysmontapMsgDispatcher struct {
 	messages chan dtx.Message
+	ctx      context.Context
 }
 
-func newSysmontapMsgDispatcher() *sysmontapMsgDispatcher {
-	return &sysmontapMsgDispatcher{make(chan dtx.Message)}
+func newSysmontapMsgDispatcher(ctx context.Context) *sysmontapMsgDispatcher {
+	return &sysmontapMsgDispatcher{
+		messages: make(chan dtx.Message),
+		ctx:      ctx,
+	}
 }
 
 func (p *sysmontapMsgDispatcher) Dispatch(m dtx.Message) {
-	p.messages <- m
+	select {
+	case p.messages <- m:
+	case <-p.ctx.Done():
+		// Close must release pending dispatches even if nobody is receiving.
+	}
 }
 
 const sysmontapName = "com.apple.instruments.server.services.sysmontap"
@@ -29,6 +38,9 @@ type sysmontapService struct {
 
 	deviceInfoService *DeviceInfoService
 	msgDispatcher     *sysmontapMsgDispatcher
+
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewSysmontapService creates a new sysmontapService
@@ -42,9 +54,11 @@ func NewSysmontapService(device ios.DeviceEntry, samplingInterval int) (*sysmont
 		return nil, err
 	}
 
-	msgDispatcher := newSysmontapMsgDispatcher()
+	ctx, cancel := context.WithCancel(context.Background())
+	msgDispatcher := newSysmontapMsgDispatcher(ctx)
 	dtxConn, err := connectInstrumentsWithMsgDispatcher(device, msgDispatcher)
 	if err != nil {
+		cancel()
 		deviceInfoService.Close()
 		return nil, err
 	}
@@ -53,6 +67,7 @@ func NewSysmontapService(device ios.DeviceEntry, samplingInterval int) (*sysmont
 
 	sysAttrs, err := deviceInfoService.systemAttributes()
 	if err != nil {
+		cancel()
 		deviceInfoService.Close()
 		dtxConn.Close()
 		return nil, err
@@ -60,6 +75,7 @@ func NewSysmontapService(device ios.DeviceEntry, samplingInterval int) (*sysmont
 
 	procAttrs, err := deviceInfoService.processAttributes()
 	if err != nil {
+		cancel()
 		deviceInfoService.Close()
 		dtxConn.Close()
 		return nil, err
@@ -76,6 +92,7 @@ func NewSysmontapService(device ios.DeviceEntry, samplingInterval int) (*sysmont
 	}
 	_, err = processControlChannel.MethodCall("setConfig:", config)
 	if err != nil {
+		cancel()
 		deviceInfoService.Close()
 		dtxConn.Close()
 		return nil, err
@@ -83,41 +100,50 @@ func NewSysmontapService(device ios.DeviceEntry, samplingInterval int) (*sysmont
 
 	err = processControlChannel.MethodCallAsync("start")
 	if err != nil {
+		cancel()
 		deviceInfoService.Close()
 		dtxConn.Close()
 		return nil, err
 	}
 
-	return &sysmontapService{processControlChannel, dtxConn, deviceInfoService, msgDispatcher}, nil
+	return &sysmontapService{processControlChannel, dtxConn, deviceInfoService, msgDispatcher, ctx, cancel}, nil
 }
 
-// Close closes up the DTX connection, message dispatcher and dtx.Message channel
+// Close cancels dispatch and receive operations before closing the DTX connections.
 func (s *sysmontapService) Close() error {
-	close(s.msgDispatcher.messages)
+	s.cancel()
 
 	s.deviceInfoService.Close()
 	return s.conn.Close()
 }
 
 // ReceiveCPUUsage returns a chan of SysmontapMessage with CPU Usage info
-// The method will close the result channel automatically as soon as sysmontapMsgDispatcher's
-// dtx.Message channel is closed.
+// The result channel is closed when the service is closed.
 func (s *sysmontapService) ReceiveCPUUsage() chan SysmontapMessage {
 	messages := make(chan SysmontapMessage)
 	go func() {
 		defer close(messages)
+		defer golog.Info("sysmontap receiver stopped", "module", logModule)
 
-		for msg := range s.msgDispatcher.messages {
+		for {
+			var msg dtx.Message
+			select {
+			case msg = <-s.msgDispatcher.messages:
+			case <-s.ctx.Done():
+				return
+			}
 			sysmontapMessage, err := mapToCPUUsage(msg)
 			if err != nil {
 				golog.Debug("expected `sysmontapMessage` from global channel, but received different message", "module", logModule, "message", msg)
 				continue
 			}
 
-			messages <- sysmontapMessage
+			select {
+			case messages <- sysmontapMessage:
+			case <-s.ctx.Done():
+				return
+			}
 		}
-
-		golog.Info("sysmontap message dispatcher channel closed", "module", logModule)
 	}()
 
 	return messages
