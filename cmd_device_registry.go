@@ -100,6 +100,7 @@ var deviceCommands = []command{
 		run: runLaunchCommand,
 	},
 	commandByBool("sysmontap", runSysmontapCommand),
+	commandByBool("sysstats", runSysstatsCommand),
 	commandByBool("memlimitoff", runMemlimitOffCommand),
 	commandByBool("kill", runKillCommand),
 	commandByBool("runtest", runTestCommand),

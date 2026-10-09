@@ -205,3 +205,25 @@ func TestMapToCPUUsage_MultiElementPayloadUsesFirst(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, uint64(8), result.CPUCount)
 }
+
+func TestSystemMetricsRecordedSample(t *testing.T) {
+	// Memory counters from the original device capture.
+	result := validResultMap()
+	result["SystemAttributes"] = []interface{}{
+		"physMemSize", "vmFreeCount", "vmIntPageCount", "vmCompressorPageCount",
+		"vmWireCount", "vmExtPageCount", "vmPurgeableCount", "vmUsedCount",
+		"__vmSwapUsage",
+	}
+	result["System"] = []interface{}{
+		uint64(189271), uint64(2104), uint64(56529), uint64(32391),
+		uint64(42706), uint64(45714), uint64(313), uint64(187167),
+		uint64(31981568),
+	}
+	sample, err := mapToCPUAndSystemMetrics(buildSysmontapMsg(result), false)
+	require.NoError(t, err)
+	assert.Equal(t, MemoryUsage{
+		Total: 3101016064, Free: 34471936, Cache: 754106368,
+		Available: 788578304, Compressed: 530694144, Used: 2312437760,
+		Wired: 699695104, Swap: 31981568, Application: 926171136,
+	}, sample.MemoryUsage)
+}

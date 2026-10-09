@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
+	"sort"
 
 	"github.com/danielpaulus/go-ios/ios"
 	"github.com/danielpaulus/go-ios/ios/afc"
@@ -172,4 +174,82 @@ func runLockdownCommand(ctx commandContext) {
 
 func runSysmontapCommand(ctx commandContext) {
 	printSysmontapStats(ctx.Device)
+}
+
+func runSysstatsCommand(ctx commandContext) {
+	details, _ := ctx.Args.Bool("--details")
+	useSysmontapFormat, _ := ctx.Args.Bool("--sysmontap-format")
+	printSystemStats(ctx.Device, 1, JSONdisabled, details, useSysmontapFormat)
+}
+
+func printSystemStats(device ios.DeviceEntry, cpuSampleDelay int, disableJSON bool, details bool, useSysmontapFormat bool) {
+	stats, err := instruments.GetSystemMetrics(device, cpuSampleDelay)
+	if err != nil {
+		exitIfError("Error querying device stats", err)
+	}
+
+	if useSysmontapFormat {
+		fields := []any{
+			"cpu_count", stats.CPUCount,
+			"enabled_cpus", stats.EnabledCPUs,
+			"end_time", stats.EndMachAbsTime,
+			"cpu_total_load", stats.SystemCPUUsage.CPU_TotalLoad,
+			"memory_total", stats.MemoryUsage.Total,
+			"memory_free", stats.MemoryUsage.Free,
+			"memory_used", stats.MemoryUsage.Used,
+			"memory_available", stats.MemoryUsage.Available,
+			"memory_compressed", stats.MemoryUsage.Compressed,
+			"memory_swap", stats.MemoryUsage.Swap,
+			"memory_wired", stats.MemoryUsage.Wired,
+			"memory_application", stats.MemoryUsage.Application,
+			"memory_cache", stats.MemoryUsage.Cache,
+		}
+		if details {
+			fields = append(fields, "raw_metrics", stats.RawSystemMetrics)
+		}
+		slog.Info("received system stats", fields...)
+		return
+	}
+	if !disableJSON {
+		if !details {
+			stats.RawSystemMetrics = nil
+		}
+		fmt.Println(convertToJSONString(stats))
+		return
+	}
+
+	fmt.Println("=== CPU Info ===")
+	fmt.Printf("CPUCount: %d\n", stats.CPUCount)
+	fmt.Printf("EnabledCPUs: %d\n", stats.EnabledCPUs)
+	fmt.Printf("EndMachAbsTime: %d\n", stats.EndMachAbsTime)
+	fmt.Println("--- System CPU Usage ---")
+	fmt.Printf("CPU_TotalLoad: %.2f\n", stats.SystemCPUUsage.CPU_TotalLoad)
+
+	fmt.Println("\n=== Memory Usage ===")
+	fmt.Printf("Total: %d\n", stats.MemoryUsage.Total)
+	fmt.Printf("Used: %d\n", stats.MemoryUsage.Used)
+	fmt.Printf("Cache: %d\n", stats.MemoryUsage.Cache)
+	fmt.Printf("Swap: %d\n", stats.MemoryUsage.Swap)
+	fmt.Printf("Free: %d\n", stats.MemoryUsage.Free)
+	fmt.Printf("Available: %d\n", stats.MemoryUsage.Available)
+	fmt.Printf("Application: %d\n", stats.MemoryUsage.Application)
+	fmt.Printf("Wired: %d\n", stats.MemoryUsage.Wired)
+	fmt.Printf("Compressed: %d\n", stats.MemoryUsage.Compressed)
+
+	if !details {
+		return
+	}
+
+	fmt.Println("\n=== Raw System Metrics ===")
+	// Get sorted keys
+	keys := make([]string, 0, len(stats.RawSystemMetrics))
+	for k := range stats.RawSystemMetrics {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	// Print sorted metrics
+	for _, k := range keys {
+		fmt.Printf("%s: %d\n", k, stats.RawSystemMetrics[k])
+	}
 }

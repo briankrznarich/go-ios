@@ -108,6 +108,7 @@ func needsAutomaticTunnelInfo(args docopt.Opts) bool {
 		"setlocationgpx",
 		"syslog",
 		"sysmontap",
+		"sysstats",
 	} {
 		if boolArg(args, commandName) {
 			return true

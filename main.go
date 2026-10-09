@@ -153,6 +153,7 @@ Usage:
   ios syslog [--parse] [options]
   ios ostrace [--pid=<processID>] [--process=<processName>] [--follow] [--level=<levels>] [--subsystem=<sub>] [--match=<str>] [--exclude=<str>] [options]
   ios sysmontap [options]
+  ios sysstats [--details] [--sysmontap-format] [options]
   ios timeformat (24h | 12h | toggle | get) [--force] [options]
   ios tunnel ls [options]
   ios tunnel stop [options]
@@ -574,7 +575,9 @@ The commands work as following:
                                                                        --subsystem=<sub>     Only show entries matching this subsystem (substring match)
                                                                        --match=<str>         Only show entries where the message contains this string
                                                                        --exclude=<str>       Hide entries where the message contains this string
-    ios sysmontap                                                   Get system stats like MEM, CPU
+    ios sysmontap                                                   Monitors CPU info
+    ios sysstats [--details] [--sysmontap-format]                      Get current CPU and memory stats. Use --nojson for a human-readable listing. Specify --details for raw system values, including disk and network counters.
+                                                                       Memory sizes are bytes. Raw vm* page counts use __vmPageSize; swap and IO byte counters are already bytes. Use --sysmontap-format for consistency with sysmontap.
 
     ios timeformat (24h | 12h | toggle | get) [--force] [options]   Sets, or returns the state of the "time format".
                                                                     iOS 11+ only (Use --force to try on older versions).

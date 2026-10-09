@@ -92,7 +92,8 @@ Commands:
   sign app                        Sign an app with a P12 and profile; run ui download first for WDA or DeviceKit artifacts.
   sign provision appstoreconnect  Create signing assets through App Store Connect.
   syslog                          Stream device syslog.
-  sysmontap                       Stream CPU and memory metrics.
+  sysmontap                       Stream CPU metrics.
+  sysstats                        Read CPU and memory stats once; --details includes raw disk and network counters.
   timeformat                      Manage time format setting.
   tunnel ls                       List running tunnels.
   tunnel start                    Start iOS 17+ tunnel and pair if needed.

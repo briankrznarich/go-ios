@@ -252,7 +252,10 @@ commands:
     summary: Stream os_trace_relay logs.
   - path: sysmontap
     usage: ios sysmontap [options]
-    summary: Stream CPU and memory metrics.
+    summary: Stream CPU metrics.
+  - path: sysstats
+    usage: ios sysstats [--details] [--sysmontap-format] [options]
+    summary: Read CPU and memory stats once; --details includes raw disk and network counters.
   - path: timeformat
     usage: ios timeformat (24h | 12h | toggle | get) [--force] [options]
     summary: Manage time format setting.
